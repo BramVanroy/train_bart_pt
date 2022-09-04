@@ -92,11 +92,11 @@ def permute_sentences(input_ids, tokenizer: PreTrainedTokenizerBase, *, permute_
 
 def get_word_starts(input_ids, mask_whole_word):
     if mask_whole_word is not None:
-        is_word_start = mask_whole_word.gather(0, input_ids)
+        is_word_start = mask_whole_word.gather(0, input_ids.view(-1)).reshape(input_ids.size())
     else:
-        is_word_start = torch.ones(input_ids.size())
-    is_word_start[0] = 0
-    is_word_start[-1] = 0
+        is_word_start = torch.full_like(input_ids, True, dtype=torch.bool)
+    is_word_start[:, 0] = False
+    is_word_start[:, -1] = False
     return is_word_start
 
 
@@ -109,8 +109,6 @@ def add_whole_word_mask(input_ids, tokenizer: PreTrainedTokenizerBase, *, mask_r
     num_inserts = 0
     if num_to_mask == 0:
         return input_ids
-
-
 
     if mask_span_distribution is not None:
         lengths = mask_span_distribution.sample(sample_shape=(num_to_mask,))
@@ -274,9 +272,7 @@ def main():
 
     mask_whole_word = torch.full((len(tokenizer),), False)
     mask_whole_word[tokenizer.all_special_ids] = True
-    mask_whole_word[tokenizer.convert_tokens_to_ids("cookie")] = True
-    print(mask_whole_word)
-
+    mask_whole_word[20931] = True  # Ġcookie
     processed = process(input_ids, tokenizer, mask_whole_word=mask_whole_word)
 
     input_ids_out = processed["input_ids"]
