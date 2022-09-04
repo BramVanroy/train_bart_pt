@@ -4,12 +4,13 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+
 # I follow defaults based on this post: https://github.com/facebookresearch/fairseq/issues/1899#issuecomment-1069429320
 # random_ratio = mask_random (cf. https://github.com/facebookresearch/fairseq/blob/a6a63279422f846a3c2f6c45b9c96d6951cc4b82/fairseq/data/denoising_dataset.py#L143)
 # Mask whole word is created as per here: https://github.com/facebookresearch/fairseq/blob/b5a039c292facba9c73f59ff34621ec131d82341/fairseq/tasks/multilingual_masked_lm.py#L118
 # but it is not enabled by default (as the given defaults do not contain mask_whole_words)
 def process(input_ids, tokenizer: PreTrainedTokenizerBase, permute_sentence_ratio=1.0, mask_ratio=0.3,
-            random_ratio =0.1, poisson_lambda=3.5, mask_length="span-poisson", mask_whole_word =None):
+            random_ratio=0.1, poisson_lambda=3.5, mask_length="span-poisson", mask_whole_word=None):
     source, target = input_ids, input_ids.clone()
 
     mask_span_distribution = None
@@ -32,9 +33,11 @@ def process(input_ids, tokenizer: PreTrainedTokenizerBase, permute_sentence_rati
     if permute_sentence_ratio > 0.0:
         source = permute_sentences(source, tokenizer, permute_sentence_ratio=permute_sentence_ratio)
 
+    print("PERMUTED SENTENCES", tokenizer.decode(source))
+
     if mask_ratio > 0:
         source = add_whole_word_mask(source, tokenizer, mask_ratio=mask_ratio, random_ratio=random_ratio,
-                                     mask_span_distribution=mask_span_distribution, mask_whole_word=mask_whole_word )
+                                     mask_span_distribution=mask_span_distribution, mask_whole_word=mask_whole_word)
 
     assert (source >= 0).all()
     assert (source[1:-1] >= 1).all()
@@ -49,12 +52,8 @@ def process(input_ids, tokenizer: PreTrainedTokenizerBase, permute_sentence_rati
 
 def permute_sentences(input_ids, tokenizer: PreTrainedTokenizerBase, *, permute_sentence_ratio=1.0):
     full_stops = input_ids == tokenizer.pad_token_id
-
-    print(full_stops)
     # Pretend it ends with a full stop so last span is a sentence
     full_stops[-2] = 1
-
-    print(full_stops)
 
     # Tokens that are full stops, where the previous token is not
     sentence_ends = (full_stops[1:] * ~full_stops[:-1]).nonzero(as_tuple=False) + 2
@@ -68,10 +67,21 @@ def permute_sentences(input_ids, tokenizer: PreTrainedTokenizerBase, *, permute_
 
     # Ignore <bos> at start
     index = 1
-    for i in ordering:
-        sentence = input_ids[(sentence_ends[i - 1] if i > 0 else 1): sentence_ends[i]]
+    for order_idx, orig_sent_idx in enumerate(ordering):
+        is_last_orig = orig_sent_idx == num_sentences-1
+        is_last_in_loop = order_idx == num_sentences-1
+        start_idx = sentence_ends[orig_sent_idx - 1] if orig_sent_idx > 0 else 1
+        # remove last idx (pad) from last sentence of this loop but only if it is not the orig last sentence
+        end_idx = sentence_ends[orig_sent_idx] - (int(is_last_in_loop) if not is_last_orig else 0)
+        sentence = input_ids[start_idx:end_idx]
+
+        # add padding token if this was the original last sentence and now it isn't anymore
+        if is_last_orig and not is_last_in_loop:
+            sentence = torch.cat((sentence, torch.LongTensor([tokenizer.pad_token_id])))
+
         result[index: index + sentence.size(0)] = sentence
         index += sentence.size(0)
+
     return result
 
 
@@ -87,7 +97,7 @@ def get_word_starts(input_ids, mask_whole_word):
 
 def add_whole_word_mask(input_ids, tokenizer: PreTrainedTokenizerBase, *, mask_ratio=0.3, random_ratio=0.1,
                         replace_length=1, mask_span_distribution=None, mask_whole_word=None):
-    is_word_start = get_word_starts(input_ids, mask_whole_word=mask_whole_word )
+    is_word_start = get_word_starts(input_ids, mask_whole_word=mask_whole_word)
     num_to_mask = int(math.ceil(is_word_start.float().sum() * mask_ratio))
     num_inserts = 0
     if num_to_mask == 0:
@@ -201,7 +211,7 @@ def add_whole_word_mask(input_ids, tokenizer: PreTrainedTokenizerBase, *, mask_r
 def add_insertion_noise(input_ids, tokenizer: PreTrainedTokenizerBase, p, *, random_ratio=0.1):
     if p == 0.0:
         return input_ids
-
+    print("ADDED NOISE")
     num_tokens = len(input_ids)
     n = int(math.ceil(num_tokens * p))
 
@@ -234,9 +244,9 @@ def get_n_nonspecial_tokens(tokens, all_special_ids):
 
 def main():
     tokenizer = AutoTokenizer.from_pretrained("facebook/bart-base")
-    text = "On september 2nd the Group of Seven (G7) countries launched a new attempt to regain the advantage in the" \
-           f" West’s energy confrontation with Russia.{tokenizer.pad_token}Imposing a price cap on purchases of Russian oil and oil" \
-           " products, probably to take effect on December 5th."
+    text = "A cookie is a baked or cooked snack or dessert that is typically small, flat and sweet." \
+           f"{tokenizer.pad_token}It usually contains flour, sugar, egg, and some type of oil, fat, or butter." \
+           f"{tokenizer.pad_token}It may include other ingredients such as raisins, oats, chocolate chips, nuts, etc."
     encoded = tokenizer(text, return_tensors="pt")
     input_ids = encoded["input_ids"].squeeze()
     n_input_toks = get_n_nonspecial_tokens(input_ids, tokenizer.all_special_ids)
@@ -246,8 +256,8 @@ def main():
     n_output_toks = get_n_nonspecial_tokens(input_ids_out, tokenizer.all_special_ids)
     print("DECODED OUTPUT", tokenizer.decode(input_ids_out))
 
-    n_masks_out = get_n_mask_tokens(input_ids_out, tokenizer.mask_token_id) + (n_input_toks-n_output_toks)
-    print(f"MASK RATIO ({n_masks_out}/{n_input_toks})", n_masks_out/n_input_toks)
+    n_masks_out = get_n_mask_tokens(input_ids_out, tokenizer.mask_token_id) + (n_input_toks - n_output_toks)
+    print(f"MASK RATIO ({n_masks_out}/{n_input_toks})", n_masks_out / n_input_toks)
 
 
 if __name__ == '__main__':
