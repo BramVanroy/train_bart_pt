@@ -307,39 +307,45 @@ class DataCollatorForBartDenoisingLM:
         """
         print("INPUTS", input_ids.size())
         print("LABELS", labels.size())
-        special_tokens_mask_labels = torch.BoolTensor([
-            self.tokenizer.get_special_tokens_mask(sequence, already_has_special_tokens=True) for sequence in labels
-        ])
-        print("special_tokens_mask_labels", special_tokens_mask_labels.size())
-
         special_tokens_mask_inputs = torch.BoolTensor([
             self.tokenizer.get_special_tokens_mask(sequence, already_has_special_tokens=True) for sequence in input_ids
         ])
         print("special_tokens_mask_inputs", special_tokens_mask_inputs.size())
 
+        special_tokens_mask_labels = torch.BoolTensor([
+            self.tokenizer.get_special_tokens_mask(sequence, already_has_special_tokens=True) for sequence in labels
+        ])
+        print("special_tokens_mask_labels", special_tokens_mask_labels.size())
+
         # determine how many tokens we need to mask in total
         is_token_mask = ~(input_ids == self.tokenizer.pad_token_id) & ~special_tokens_mask_inputs
         print("is_token_mask", is_token_mask.size())
+
         num_tokens_to_mask = int(math.ceil(is_token_mask.sum() * self.mask_ratio))
         print("num_tokens_to_mask", num_tokens_to_mask)
+
         if num_tokens_to_mask == 0:
             return input_ids, labels
 
         # generate a sufficient number of span lengths
-        span_lengths = np.random.poisson(lam=self.poisson_lambda, size=(num_tokens_to_mask,))
+        rng = np.random.default_rng()
+        span_lengths = rng.poisson(lam=self.poisson_lambda, size=(num_tokens_to_mask,))
+        print("span_lengths1", span_lengths)
         while np.cumsum(span_lengths, 0)[-1] < num_tokens_to_mask:
             span_lengths = np.concatenate(
-                [span_lengths, np.random.poisson(lam=self.poisson_lambda, size=(num_tokens_to_mask,))]
+                [span_lengths, rng.poisson(lam=self.poisson_lambda, size=(num_tokens_to_mask,))]
             )
-
+        print("span_lengths2", span_lengths)
         # remove all spans of length 0
         # note that BART inserts additional mask tokens where length == 0,
         # which we do not implement for now as it adds additional complexity
         span_lengths = span_lengths[span_lengths > 0]
+        print("span_lengths2 no null", span_lengths)
 
         # trim to about num_tokens_to_mask tokens
         cutoff_idx = np.argmin(np.abs(np.cumsum(span_lengths, 0) - num_tokens_to_mask)) + 1
         span_lengths = span_lengths[:cutoff_idx]
+        print("span_lengths2 only ~num_tokens_to_mask", span_lengths)
 
         # randomly choose starting positions for masking
         token_indices = np.argwhere(is_token_mask == 1)
