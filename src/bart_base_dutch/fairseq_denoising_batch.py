@@ -90,11 +90,13 @@ def permute_sentences(input_ids, tokenizer: PreTrainedTokenizerBase, *, permute_
     return all_results
 
 
-def get_word_starts(input_ids, mask_whole_word):
+def get_word_starts(input_ids, tokenizer, mask_whole_word=None):
     if mask_whole_word is not None:
-        is_word_start = mask_whole_word.gather(0, input_ids.view(-1)).reshape(input_ids.size())
+        is_word_start = mask_whole_word.gather(0, input_ids.view(-1), dtype=torch.bool).reshape(input_ids.size())
     else:
-        is_word_start = torch.full_like(input_ids, True, dtype=torch.bool)
+        is_word_start = ~torch.BoolTensor([
+            tokenizer.get_special_tokens_mask(seq, already_has_special_tokens=True) for seq in input_ids
+        ])
     is_word_start[:, 0] = False
     is_word_start[:, -1] = False
     return is_word_start
@@ -102,10 +104,9 @@ def get_word_starts(input_ids, mask_whole_word):
 
 def add_whole_word_mask(input_ids, tokenizer: PreTrainedTokenizerBase, *, mask_ratio=0.3, random_ratio=0.1,
                         replace_length=1, mask_span_distribution=None, mask_whole_word=None):
-    is_word_start = get_word_starts(input_ids, mask_whole_word=mask_whole_word)
-    print(is_word_start)
-    print(is_word_start.sum())
+    is_word_start = get_word_starts(input_ids, tokenizer, mask_whole_word=mask_whole_word)
     num_to_mask = int(math.ceil(is_word_start.float().sum() * mask_ratio))
+
     num_inserts = 0
     if num_to_mask == 0:
         return input_ids
@@ -144,7 +145,7 @@ def add_whole_word_mask(input_ids, tokenizer: PreTrainedTokenizerBase, *, mask_r
         assert (lengths > 0).all()
     else:
         lengths = torch.ones((num_to_mask,)).long()
-
+        
     assert not is_word_start[:, 0].any()
     assert not is_word_start[:, -1].any()
 
@@ -270,10 +271,7 @@ def main():
     n_input_toks = get_n_nonspecial_tokens(input_ids, tokenizer.all_special_ids)
     print("DECODED INPUT", tokenizer.batch_decode(input_ids))
 
-    mask_whole_word = torch.full((len(tokenizer),), False)
-    mask_whole_word[tokenizer.all_special_ids] = True
-    mask_whole_word[20931] = True  # Ġcookie
-    processed = process(input_ids, tokenizer, mask_whole_word=mask_whole_word)
+    processed = process(input_ids, tokenizer)
 
     input_ids_out = processed["input_ids"]
     n_output_toks = get_n_nonspecial_tokens(input_ids_out, tokenizer.all_special_ids)
