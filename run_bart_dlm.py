@@ -180,6 +180,12 @@ class DataTrainingArguments:
                 if extension not in {"csv", "json", "txt"}:
                     raise ValueError("`validation_file` should be a csv, a json or a txt file.")
 
+        if self.mlm_probability > 1.0:
+            raise ValueError(f"'mlm_probability' should be less than or equal to 1.0")
+
+        if self.permute_sentence_ratio > 1.0:
+            raise ValueError(f"'permute_sentence_ratio' should be less than or equal to 1.0")
+
 
 @dataclass
 class DataCollatorForBartDenoisingLM:
@@ -315,6 +321,7 @@ class DataCollatorForBartDenoisingLM:
         is_token_mask = ~(input_ids == self.tokenizer.pad_token_id) & ~special_tokens_mask_inputs
         print("is_token_mask", is_token_mask.size())
         num_tokens_to_mask = int(math.ceil(is_token_mask.sum() * self.mask_ratio))
+        print("num_tokens_to_mask", num_tokens_to_mask)
         if num_tokens_to_mask == 0:
             return input_ids, labels
 
@@ -340,12 +347,9 @@ class DataCollatorForBartDenoisingLM:
         # prepare mask
         masked_indices = np.array(token_indices[span_starts])
         mask = np.full_like(input_ids, fill_value=False)
-        print("MASK", mask)
-        print("MASK", mask.shape)
+
         # mask starting positions
         for mi in masked_indices:
-            print("MI", mi)
-            print("MI", len(mi))
             mask[tuple(mi)] = True  # TODO: error here
         span_lengths -= 1
 
