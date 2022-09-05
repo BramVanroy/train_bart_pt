@@ -44,7 +44,6 @@ def main():
                          help="Name of the split to use for tokenizer training (typically 'train')")
     cparser.add_argument("--dataset_textcol", default="text",
                          help="Name of the text column to use for tokenizer training")
-    --dataset_split plain_text --dataset_split unsupervised --dout bart-base-dutch
     cparser.add_argument("--vocab_size", type=int, default=50265, help="Vocabulary size")
     cparser.add_argument("--min_frequency", type=int, default=2, help="Minimal frequency of tokens")
     cparser.add_argument("--special_tokens", nargs="+", default=["<s>", "<pad>", "</s>", "<unk>", "<mask>"],
