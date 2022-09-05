@@ -42,7 +42,7 @@ class DataCollatorForBartDenoisingLM:
         poisson_lambda (:obj:`float`):
             Mean parameter of Poisson distribution used to generate span-lengths to be masked
         mask_length (:obj:`str`):
-            Whether to add span masks ("span-poisson")
+            Whether to add span, word or subword masks ("span-poisson", "word", "subword")
         mask_whole_word (:obj:`torch.Tensor`):
             A tensor of the size of the vocabulary to indicate which of the tokens are the start of a word.
             Also see the
@@ -362,34 +362,17 @@ class DataCollatorForBartDenoisingLM:
         return all_results
 
 
-def get_n_mask_tokens(tokens, mask_token_id):
-    if mask_token_id not in tokens:
-        return 0
-
-    unique, counts = np.unique(tokens, return_counts=True)
-    counter = dict(zip(unique, counts))
-
-    return counter[mask_token_id]
-
-
-def get_n_nonspecial_tokens(batch, tokenizer):
-    if not batch.numel():  # if empty batch
-        return 0
-    return len([t for tokens in batch for t in tokens if t not in tokenizer.all_special_ids])
-
-
-class DummyDataset(torch.utils.data.Dataset):
-    def __init__(self, data):
-        self.data = data
-
-    def __getitem__(self, idx):
-        return self.data[idx]
-
-    def __len__(self):
-        return len(self.data)
-
-
 def main():
+    class DummyDataset(torch.utils.data.Dataset):
+        def __init__(self, data):
+            self.data = data
+
+        def __getitem__(self, idx):
+            return self.data[idx]
+
+        def __len__(self):
+            return len(self.data)
+
     tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained("facebook/bart-base")
     # Two sequences, containing a padtoken to separate sentences
     text = ["A cookie is a baked or cooked snack or dessert that is typically small, flat and sweet."

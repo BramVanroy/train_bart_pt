@@ -14,8 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Pretraining models for denoising language modeling on a text file or a dataset.
-Here is the full list of checkpoints on the hub that can be pretrained by this script:
-https://huggingface.co/models?filter=bart
 """
 import logging
 import math
@@ -23,28 +21,24 @@ import os
 import sys
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Dict, List, Optional
+from typing import Optional
 
 import evaluate
-import numpy as np
 import datasets
-import torch
 import transformers
 from datasets import load_dataset
-from torch.utils.data import default_collate
 
 from transformers import (
     BartTokenizer,
     BartConfig,
-    BatchEncoding,
     BartForConditionalGeneration,
     HfArgumentParser,
-    PreTrainedTokenizerBase,
     Trainer, TrainingArguments,
     is_torch_tpu_available, set_seed,
 )
-from transformers.models.bart.modeling_bart import shift_tokens_right
 from transformers.trainer_utils import get_last_checkpoint
+
+from denoising_collator import DataCollatorForBartDenoisingLM
 
 logger = logging.getLogger(__name__)
 
@@ -131,15 +125,6 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
-    mlm_probability: float = field(
-        default=0.3, metadata={"help": "Ratio of tokens to mask for span masked language modeling loss"}
-    )
-    permute_sentence_ratio: float = field(
-        default=1.0, metadata={"help": "Ratio of sentences to be permuted in each document"}
-    )
-    poisson_lambda: float = field(
-        default=3.5, metadata={"help": "Mean of Poisson distribution used to generate span-lengths to be masked"}
-    )
     max_train_samples: Optional[int] = field(
         default=None,
         metadata={
@@ -159,12 +144,32 @@ class DataTrainingArguments:
         },
     )
     spacy_model: Optional[str] = field(
-        default= None,
+        default=None,
         metadata={
             "help": "By default, an English NLTK punct model is used for sentence splitting. If you give a spacy_model"
                     " name instead, we'll use that for sentence splitting. Note that spaCy and the chosen model have"
                     " to be installe.d"
         }
+    )
+    mask_ratio: float = field(
+        default=0.3, metadata={"help": "Ratio of tokens to mask for span masked language modeling loss"}
+    )
+    random_ratio: float = field(
+        default=0.1, metadata={"help": "The probability with which to (randomly) replace a token by a random token"}
+    )
+    insert_ratio: float = field(
+        default=0.0, metadata={"help": "The probability with which to (randomly) insert noise. Will add"
+                                       " `insert_ratio * input.numel()` noise"}
+    )
+    rotate_ratio: float = field(
+        default=0.0, metadata={"help": "The probability with which to (randomly) add rolling noise (i.e., shifted"
+                                       " tokens in order)"}
+    )
+    permute_sentence_ratio: float = field(
+        default=1.0, metadata={"help": "Ratio of sentences to be permuted in each document"}
+    )
+    poisson_lambda: float = field(
+        default=3.5, metadata={"help": "Mean of Poisson distribution used to generate span-lengths to be masked"}
     )
 
     def __post_init__(self):
@@ -180,263 +185,8 @@ class DataTrainingArguments:
                 if extension not in {"csv", "json", "txt"}:
                     raise ValueError("`validation_file` should be a csv, a json or a txt file.")
 
-        if self.mlm_probability > 1.0:
-            raise ValueError(f"'mlm_probability' should be less than or equal to 1.0")
-
-        if self.permute_sentence_ratio > 1.0:
-            raise ValueError(f"'permute_sentence_ratio' should be less than or equal to 1.0")
-
-
-@dataclass
-class DataCollatorForBartDenoisingLM:
-    """
-    Data collator used for BART denoising language modeling. The code is largely copied from
-    `<https://github.com/morganmcg1/rotobart/blob/main/data_collator.py#L223>`__.
-    For more information on how BART denoising language modeling works, one can take a look
-    at the `official paper <https://arxiv.org/pdf/1910.13461.pdf>`__
-    or the `official code for preprocessing <https://github.com/facebookresearch/fairseq/blob/main/fairseq/data/denoising_dataset.py>`__ .
-    Args:
-        tokenizer (:class:`~transformers.PreTrainedTokenizer` or :class:`~transformers.PreTrainedTokenizerFast`):
-            The tokenizer used for encoding the data
-        decoder_start_token_id: (:obj:`int):
-            The decoder start token id of the model
-        mask_ratio (:obj:`float`):
-            The probability with which to (randomly) mask tokens in the input
-        poisson_lambda (:obj:`float`):
-            Mean parameter of Poisson distribution used to generate span-lengths to be masked
-        permute_sentence_ratio (:obj:`float`):
-            Ratio of sentences to be permuted in each document
-    """
-    tokenizer: PreTrainedTokenizerBase
-    decoder_start_token_id: int
-    mask_ratio: float = 0.3
-    poisson_lambda: float = 3.0
-    permute_sentence_ratio: float = 1.0
-
-    def __post_init__(self):
-        if self.tokenizer.mask_token is None or self.tokenizer.eos_token is None:
-            raise ValueError(
-                "This tokenizer does not have a mask token or eos token token which is necessary for denoising"
-                " language modeling. "
-            )
-
-    def __call__(self, examples: List[Dict[str, List[int]]], verbose=False) -> BatchEncoding:
-        # convert list to dict and tensorize input
-        batch = BatchEncoding(
-            {k: [examples[i][k] for i in range(len(examples))] for k, v in examples[0].items()},
-            tensor_type="pt"
-        )
-
-        if verbose:
-            print("INPUT TENSOR SIZE", batch["input_ids"].size())
-
-        batch["labels"] = batch["input_ids"].clone()
-        batch["decoder_input_ids"] = shift_tokens_right(
-            batch["labels"], self.tokenizer.pad_token_id, self.decoder_start_token_id
-        )
-
-        if verbose:
-            print("decoder_input_ids TENSOR SIZE", batch["decoder_input_ids"].size())
-
-        # permuting sentences
-        do_permute = False
-        if self.permute_sentence_ratio > 0.0:
-            batch["input_ids"] = self.permute_sentences(batch["input_ids"])
-            do_permute = True
-
-        print(batch["input_ids"])
-        print(batch["labels"])
-        exit()
-
-        if verbose:
-            print("INPUT TENSOR SIZE AFTER PERMUtE", batch["input_ids"].size())
-        # masking span of tokens (text infilling in the paper)
-        if self.mask_ratio:
-            batch["input_ids"], batch["labels"] = self.span_mask_tokens(
-                batch["input_ids"], batch["labels"], do_permute
-            )
-            print(batch["input_ids"])
-            exit()
-        if verbose:
-            print("INPUT TENSOR SIZE AFTER MASK", batch["input_ids"].size())
-
-        # ignore pad tokens
-        batch["attention_mask"] = (batch["input_ids"] != self.tokenizer.pad_token_id).to(torch.long)
-
-        if verbose:
-            print("ATTENTION TENSOR SIZE", batch["attention_mask"].size())
-        batch["decoder_attention_mask"] = (batch["decoder_input_ids"] != self.tokenizer.pad_token_id).to(torch.long)
-        if verbose:
-            print("DECODER ATTENTION TENSOR SIZE AFTER MASK", batch["decoder_attention_mask"].size())
-
-        return batch
-
-    def permute_sentences(self, input_ids):
-        """
-        Shuffle sentences in each document.
-        """
-        results = input_ids.clone()
-
-        # find end locations of sentences
-        end_sentence_mask = input_ids == self.tokenizer.pad_token_id
-        sentence_ends = np.argwhere(end_sentence_mask)
-        sentence_ends[:, 1] += 1
-        example_has_multiple_sentences, num_sentences = np.unique(sentence_ends[:, 0], return_counts=True)
-        num_sentences_map = {sent_idx: count for sent_idx, count in zip(example_has_multiple_sentences, num_sentences)}
-
-        num_to_permute = np.ceil(num_sentences * self.permute_sentence_ratio).astype(int)
-        num_to_permute_map = {
-            sent_idx: count for sent_idx, count in zip(example_has_multiple_sentences, num_to_permute)
-        }
-
-        sentence_ends = np.split(sentence_ends[:, 1], np.unique(sentence_ends[:, 0], return_index=True)[1][1:])
-        sentence_ends_map = {sent_idx: count for sent_idx, count in zip(example_has_multiple_sentences, sentence_ends)}
-
-        for i in range(input_ids.shape[0]):
-            if i not in example_has_multiple_sentences:
-                continue
-            substitutions = np.random.permutation(num_sentences_map[i])[: num_to_permute_map[i]]
-            ordering = np.arange(0, num_sentences_map[i])
-            ordering[substitutions] = substitutions[np.random.permutation(num_to_permute_map[i])]
-
-            # write shuffled sentences into results
-            index = 0
-            for j in ordering:
-                sentence = input_ids[i, (sentence_ends_map[i][j - 1] if j > 0 else 0) : sentence_ends_map[i][j]]
-                results[i, index:index + sentence.shape[0]] = sentence
-                index += sentence.shape[0]
-        return results
-
-    def span_mask_tokens(self, input_ids, labels, do_permute):
-        """
-        Sampling text spans with span lengths drawn from a Poisson distribution and masking them.
-        """
-        print("INPUTS", input_ids.size())
-        print("LABELS", labels.size())
-        special_tokens_mask_inputs = torch.BoolTensor([
-            self.tokenizer.get_special_tokens_mask(sequence, already_has_special_tokens=True) for sequence in input_ids
-        ])
-        print("special_tokens_mask_inputs", special_tokens_mask_inputs.size())
-
-        special_tokens_mask_labels = torch.BoolTensor([
-            self.tokenizer.get_special_tokens_mask(sequence, already_has_special_tokens=True) for sequence in labels
-        ])
-        print("special_tokens_mask_labels", special_tokens_mask_labels.size())
-
-        # determine how many tokens we need to mask in total
-        is_token_mask = ~(input_ids == self.tokenizer.pad_token_id) & ~special_tokens_mask_inputs
-        print("is_token_mask", is_token_mask.size())
-
-        num_tokens_to_mask = int(math.ceil(is_token_mask.sum() * self.mask_ratio))
-        print("num_tokens_to_mask", num_tokens_to_mask)
-
-        if num_tokens_to_mask == 0:
-            return input_ids, labels
-
-        # generate a sufficient number of span lengths
-        rng = np.random.default_rng()
-        span_lengths = rng.poisson(lam=self.poisson_lambda, size=(num_tokens_to_mask,))
-        print("span_lengths1", span_lengths)
-        while np.cumsum(span_lengths, 0)[-1] < num_tokens_to_mask:
-            span_lengths = np.concatenate(
-                [span_lengths, rng.poisson(lam=self.poisson_lambda, size=(num_tokens_to_mask,))]
-            )
-
-        span_lengths = torch.tensor(span_lengths)
-        print("span_lengths", span_lengths)
-        # remove all spans of length 0
-        # note that BART inserts additional mask tokens where length == 0,
-        # which we do not implement for now as it adds additional complexity
-        span_lengths = span_lengths[span_lengths > 0]
-        print("span_lengths no null", span_lengths)
-
-        # trim to about num_tokens_to_mask tokens
-        cutoff_idx = torch.argmin(torch.abs(torch.cumsum(span_lengths, 0) - num_tokens_to_mask)) + 1
-        span_lengths = span_lengths[:cutoff_idx]
-        print("span_lengths only ~num_tokens_to_mask", span_lengths)
-
-        # randomly choose starting positions for masking
-        token_indices = torch.argwhere(is_token_mask == 1)
-        print("token_indices", token_indices.size())
-
-        print("span_lengths", span_lengths)
-        span_starts = torch.randperm(token_indices.size(0))[:span_lengths.size(0)]
-        print("span_starts", span_starts)
-        print("span_starts", span_starts.size(0))
-
-        # prepare mask
-        masked_indices = token_indices[span_starts]
-        print("masked_indices", masked_indices.size())
-        print("masked_indices", masked_indices)
-        mask = torch.full_like(input_ids, fill_value=False, dtype=torch.bool)
-        print("mask", mask.size())
-        print("mask", mask)
-
-        # mask starting positions
-        for mi in masked_indices:
-            mask[tuple(mi)] = True
-        print("masked_indices", mask.size())
-        print("masked_indices", mask)
-        span_lengths -= 1
-
-        # fill up spans
-        max_index = input_ids.size(1) - 1
-        print("max_index", max_index)
-
-        remaining = (span_lengths > 0) & (masked_indices[:, 1] < max_index)
-        print("remaining", remaining)
-        while torch.any(remaining):
-            masked_indices[remaining, 1] += 1
-            print("masked_indices", mask.size())
-            print("masked_indices", mask)
-            for mi in masked_indices:
-                mask[tuple(mi)] = True
-            span_lengths -= 1
-            remaining = (span_lengths > 0) & (masked_indices[:, 1] < max_index)
-
-        # place the mask tokens
-        mask[torch.where(special_tokens_mask_inputs)] = False
-        input_ids[torch.where(mask)] = self.tokenizer.mask_token_id
-        if not do_permute:
-            labels[torch.where(mask == 0)] = -100
-        else:
-            labels[torch.where(special_tokens_mask_labels)] = -100
-
-        # remove mask tokens that are not starts of spans
-        to_remove = (mask == 1) & torch.roll((mask == 1), 1, 1)
-        new_input_ids = torch.full_like(input_ids, fill_value=self.tokenizer.pad_token_id)
-        for i, example in enumerate(input_ids):
-            new_example = example[~to_remove[i]]
-            new_input_ids[i, :new_example.size(0)] = new_example
-
-        return new_input_ids, labels
-
-
-def generate_batch_splits(samples_idx: np.ndarray, batch_size: int, drop_last=True) -> np.ndarray:
-    """Generate batches of data for a specified batch size from sample indices. If the dataset size is not divisible by
-    the batch size and `drop_last` is `True`, the last incomplete batch is dropped. Else, it is returned."""
-    num_samples = len(samples_idx)
-    if drop_last:
-        samples_to_remove = num_samples % batch_size
-        if samples_to_remove != 0:
-            samples_idx = samples_idx[:-samples_to_remove]
-        sections_split = num_samples // batch_size
-        samples_idx = samples_idx.reshape((sections_split, batch_size))
-    else:
-        sections_split = math.ceil(num_samples / batch_size)
-        samples_idx = np.array_split(samples_idx, sections_split)
-    return samples_idx
-
 
 def main():
-    # TODO: go through this thing and compare with
-    # https://github.com/huggingface/transformers/tree/main/examples/flax/language-modeling
-    # and https://github.com/huggingface/transformers/blob/main/examples/pytorch/language-modeling/run_mlm.py
-
-    # See all possible arguments in src/transformers/training_args.py
-    # or by passing the --help flag to this script.
-    # We now keep distinct sets of args, for a cleaner separation of concerns.
-
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
@@ -634,7 +384,7 @@ def main():
         max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
     # Caching is not working well with spaCy so we use explicit fingerprints
-    # looping over splits because we cannot use new_fingerprint on DatasetDict
+    # Looping over splits because we cannot use new_fingerprint on DatasetDict
     for k in loaded_ds.keys():
         base_fingerprint = f"{k}@{data_args.dataset_name}{data_args.dataset_config_name}" if data_args.dataset_name else None
         # Do sentence splitting
@@ -739,9 +489,12 @@ def main():
     data_collator = DataCollatorForBartDenoisingLM(
         tokenizer=tokenizer,
         decoder_start_token_id=model.config.decoder_start_token_id,
-        mask_ratio=data_args.mlm_probability,
-        poisson_lambda=data_args.poisson_lambda,
+        mask_ratio=data_args.mask_ratio,
+        random_ratio=data_args.random_ratio,
+        insert_ratio=data_args.insert_ratio,
+        rotate_ratio=data_args.rotate_ratio,
         permute_sentence_ratio=data_args.permute_sentence_ratio,
+        poisson_lambda=data_args.poisson_lambda,
     )
 
     # Some trainer-specific submethods that may be relevant:
@@ -816,7 +569,7 @@ def main():
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
-        kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "fill-mask"}
+        kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "text2text-generation"}
         if data_args.dataset_name is not None:
             kwargs["dataset_tags"] = data_args.dataset_name
             if data_args.dataset_config_name is not None:
