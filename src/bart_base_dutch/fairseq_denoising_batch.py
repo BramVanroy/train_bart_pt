@@ -1,4 +1,5 @@
 import math
+from typing import Optional
 
 import numpy as np
 import torch
@@ -11,7 +12,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 # but it is not enabled by default (as the given defaults do not contain mask_whole_words). It should be a ByteTensor (maybe a booltensor works?) of
 # the same size as the vocabulary. For each token it indicates True if the token is the start of a word (as returned by BPE)
 def process(input_ids, tokenizer: PreTrainedTokenizerBase, permute_sentence_ratio=1.0, mask_ratio=0.3,
-            random_ratio=0.1, poisson_lambda=3.5, mask_length="span-poisson", mask_whole_word=None):
+            random_ratio=0.1, poisson_lambda=3.5, mask_length: Optional[str]="span-poisson", mask_whole_word=None):
     source, target = input_ids, input_ids.clone()
 
     mask_span_distribution = None
@@ -33,8 +34,6 @@ def process(input_ids, tokenizer: PreTrainedTokenizerBase, permute_sentence_rati
 
     if permute_sentence_ratio > 0.0:
         source = permute_sentences(source, tokenizer, permute_sentence_ratio=permute_sentence_ratio)
-
-    print("AFTER PERMUTE", tokenizer.batch_decode(source))
 
     if mask_ratio > 0:
         source = add_whole_word_mask(source, tokenizer, mask_ratio=mask_ratio, random_ratio=random_ratio,
@@ -92,18 +91,20 @@ def permute_sentences(input_ids, tokenizer: PreTrainedTokenizerBase, *, permute_
 
 def get_word_starts(input_ids, tokenizer, mask_whole_word=None):
     if mask_whole_word is not None:
-        is_word_start = mask_whole_word.gather(0, input_ids.view(-1), dtype=torch.bool).reshape(input_ids.size())
+        is_word_start = mask_whole_word.gather(0, input_ids.view(-1), dtype=torch.long).reshape(input_ids.size())
     else:
-        is_word_start = ~torch.BoolTensor([
+        is_word_start = (~torch.BoolTensor([
             tokenizer.get_special_tokens_mask(seq, already_has_special_tokens=True) for seq in input_ids
-        ])
-    is_word_start[:, 0] = False
-    is_word_start[:, -1] = False
+        ])).long()
+    is_word_start[:, 0] = 0
+    is_word_start[:, -1] = 0
     return is_word_start
 
 
 def add_whole_word_mask(input_ids, tokenizer: PreTrainedTokenizerBase, *, mask_ratio=0.3, random_ratio=0.1,
                         replace_length=1, mask_span_distribution=None, mask_whole_word=None):
+    # Note that is_word_start cannot be a booltensor but has to be an int tensor as we use it to subtract
+    # from the span lengths later on
     is_word_start = get_word_starts(input_ids, tokenizer, mask_whole_word=mask_whole_word)
     num_to_mask = int(math.ceil(is_word_start.float().sum() * mask_ratio))
 
@@ -113,132 +114,161 @@ def add_whole_word_mask(input_ids, tokenizer: PreTrainedTokenizerBase, *, mask_r
 
     if mask_span_distribution is not None:
         lengths = mask_span_distribution.sample(sample_shape=(num_to_mask,))
-
         # Make sure we have enough to mask
         cum_length = torch.cumsum(lengths, 0)
+
         while cum_length[-1] < num_to_mask:
-            lengths = torch.cat(
-                [
-                    lengths,
-                    mask_span_distribution.sample(sample_shape=(num_to_mask,)),
-                ],
-                dim=0,
-            )
+            lengths = torch.cat([lengths,
+                                 mask_span_distribution.sample(sample_shape=(num_to_mask,)),
+                                 ],
+                                dim=0)
             cum_length = torch.cumsum(lengths, 0)
 
         # Trim to masking budget
         i = 0
         while cum_length[i] < num_to_mask:
             i += 1
-        lengths[i] = num_to_mask - (0 if i == 0 else cum_length[i - 1])
+        lengths[i] = num_to_mask - (0 if i == 0 else cum_length[i-1])
         num_to_mask = i + 1
         lengths = lengths[:num_to_mask]
 
         # Handle 0-length mask (inserts) separately
+        # For every 0-length span, we instead insert noise
+        # So we decrease the required `num_to_mask` and instead add to `num_inserts`
         lengths = lengths[lengths > 0]
         num_inserts = num_to_mask - lengths.size(0)
         num_to_mask -= num_inserts
         if num_to_mask == 0:
-            return add_insertion_noise(input_ids, tokenizer, num_inserts / input_ids.size(0),
+            return add_insertion_noise(input_ids, tokenizer, num_inserts / input_ids.numel(),
                                        random_ratio=random_ratio)
 
         assert (lengths > 0).all()
     else:
-        lengths = torch.ones((num_to_mask,)).long()
-        
+        lengths = torch.ones((num_to_mask,), dtype=torch.long)
+
     assert not is_word_start[:, 0].any()
     assert not is_word_start[:, -1].any()
 
     word_starts = is_word_start.nonzero(as_tuple=False)
     indices = word_starts[
         torch.randperm(word_starts.size(0))[:num_to_mask]
-    ].squeeze(1)
+    ]
+
     mask_random = torch.FloatTensor(num_to_mask).uniform_() < random_ratio
 
-    source_length = input_ids.size(0)
-    assert source_length - 1 not in indices
-    to_keep = torch.ones(source_length, dtype=torch.bool)
-    is_word_start[
-        -1
-    ] = 255  # acts as a long length, so spans don't go over the end of doc
+    source_length = input_ids.size(1)
+    assert source_length - 1 not in indices[:, 1]
+
+    to_keep = torch.ones_like(input_ids, dtype=torch.bool)
+    is_word_start[:, -1] = 255  # acts as a long length, so spans don't go over the end of doc
+
     if replace_length == 0:
-        to_keep[indices] = 0
+        to_keep[indices[:, 0], indices[:, 1]] = 0
     else:
-        # keep index, but replace it with [MASK]
-        input_ids[indices] = tokenizer.mask_token_id
-        input_ids[indices[mask_random]] = torch.randint(
+        # Mask some tokens with a mask token
+        for idxs in indices:
+            input_ids[tuple(idxs)] = tokenizer.mask_token_id
+
+        # Replace a fraction (random_ratio) with a random token
+        rand_tokens = torch.randint(
             1, len(tokenizer), size=(mask_random.sum(),)
         )
+        for idxs, tok in zip(indices[mask_random], rand_tokens):
+            input_ids[tuple(idxs)] = tok
 
     if mask_span_distribution is not None:
-        assert len(lengths.size()) == 1
-        assert lengths.size() == indices.size()
         lengths -= 1
+
         while indices.size(0) > 0:
-            assert lengths.size() == indices.size()
-            lengths -= is_word_start[indices + 1].long()
+            lengths -= is_word_start[indices[:, 0], indices[:, 1] + 1].long()
             uncompleted = lengths >= 0
-            indices = indices[uncompleted] + 1
+            indices = indices[uncompleted, :]
+            indices[:, 1] += 1  # increment to keep masking the next positions
+
             mask_random = mask_random[uncompleted]
             lengths = lengths[uncompleted]
+
             if replace_length != -1:
-                # delete token
-                to_keep[indices] = 0
+                to_keep[indices[:, 0], indices[:, 1]] = 0
             else:
-                # keep index, but replace it with [MASK]
-                input_ids[indices] = tokenizer.mask_token_id
-                input_ids[indices[mask_random]] = torch.randint(
+                # Mask some tokens with a mask token
+                for idxs in indices:
+                    input_ids[tuple(idxs)] = tokenizer.mask_token_id
+
+                # Replace a fraction (random_ratio) with a random token
+                rand_tokens = torch.randint(
                     1, len(tokenizer), size=(mask_random.sum(),)
                 )
+                for idxs, tok in zip(indices[mask_random], rand_tokens):
+                    input_ids[tuple(idxs)] = tok
+
+            assert source_length - 1 not in indices[:, 1]
     else:
         # A bit faster when all lengths are 1
         while indices.size(0) > 0:
-            uncompleted = is_word_start[indices + 1] == 0
-            indices = indices[uncompleted] + 1
+            uncompleted = is_word_start[indices[:, 0], indices[:, 1] + 1] == 0
+            indices = indices[uncompleted, :]
+            indices[:, 1] += 1  # increment to keep masking the next positions
+
             mask_random = mask_random[uncompleted]
+
             if replace_length != -1:
-                # delete token
-                to_keep[indices] = 0
+                to_keep[indices[:, 0], indices[:, 1]] = 0
             else:
-                # keep index, but replace it with [MASK]
-                input_ids[indices] = tokenizer.mask_token_id
-                input_ids[indices[mask_random]] = torch.randint(
+                # Mask some tokens with a mask token
+                for idxs in indices:
+                    input_ids[tuple(idxs)] = tokenizer.mask_token_id
+
+                # Replace a fraction (random_ratio) with a random token
+                rand_tokens = torch.randint(
                     1, len(tokenizer), size=(mask_random.sum(),)
                 )
+                for idxs, tok in zip(indices[mask_random], rand_tokens):
+                    input_ids[tuple(idxs)] = tok
 
-            assert source_length - 1 not in indices
+            assert source_length - 1 not in indices[:, 1]
 
-    input_ids = input_ids[to_keep]
+    # Remove some items (e.g. consecutive masks)
+    final_ids = torch.full_like(input_ids, fill_value=tokenizer.pad_token_id)
+    for keeper_idx, keeper in enumerate(to_keep):
+        seq = input_ids[keeper_idx, keeper]
+        final_ids[keeper_idx, :seq.size(0)] = seq
+    input_ids = final_ids
 
     if num_inserts > 0:
-        input_ids = add_insertion_noise(input_ids, tokenizer, num_inserts / input_ids.size(0),
+        input_ids = add_insertion_noise(input_ids, tokenizer, num_inserts / input_ids.numel(),
                                         random_ratio=random_ratio)
 
     return input_ids
 
 
 def add_insertion_noise(input_ids, tokenizer: PreTrainedTokenizerBase, p, *, random_ratio=0.1):
+    # TODO: vectorize?
     if p == 0.0:
         return input_ids
 
-    num_tokens = len(input_ids)
-    n = int(math.ceil(num_tokens * p))
+    seq_num_tokens = input_ids.size(1)
+    n = int(math.ceil(seq_num_tokens * p))
+    all_results = torch.full((input_ids.size(0), seq_num_tokens+n), fill_value=tokenizer.pad_token_id)
+    for seq_id, sequence in enumerate(input_ids):
+        noise_indices = torch.randperm(seq_num_tokens + n - 2)[:n] + 1
+        noise_mask = torch.zeros(size=(seq_num_tokens + n,), dtype=torch.bool)
+        noise_mask[noise_indices] = 1
 
-    noise_indices = torch.randperm(num_tokens + n - 2)[:n] + 1
-    noise_mask = torch.zeros(size=(num_tokens + n,), dtype=torch.bool)
-    noise_mask[noise_indices] = 1
-    result = torch.LongTensor(n + len(input_ids)).fill_(-1)
+        result = torch.LongTensor(seq_num_tokens + n).fill_(-1)
 
-    num_random = int(math.ceil(n * random_ratio))
-    result[noise_indices[num_random:]] = tokenizer.mask_token_id
-    result[noise_indices[:num_random]] = torch.randint(
-        low=1, high=len(tokenizer), size=(num_random,)
-    )
+        num_random = int(math.ceil(n * random_ratio))
+        result[noise_indices[num_random:]] = tokenizer.mask_token_id
+        result[noise_indices[:num_random]] = torch.randint(
+            low=1, high=len(tokenizer), size=(num_random,)
+        )
 
-    result[~noise_mask] = input_ids
+        result[~noise_mask] = sequence
 
-    assert (result >= 0).all()
-    return result
+        assert (result >= 0).all()
+        all_results[seq_id] = result
+
+    return all_results
 
 
 def get_n_mask_tokens(tokens, mask_token_id):
@@ -251,11 +281,10 @@ def get_n_mask_tokens(tokens, mask_token_id):
     return counter[mask_token_id]
 
 
-def get_n_nonspecial_tokens(batch, all_special_ids):
-    try:
-        return len([t for t in batch if t not in all_special_ids])  # squeezed 1-item batch
-    except RuntimeError:
-        return len([t for tokens in batch for t in tokens if t not in all_special_ids])
+def get_n_nonspecial_tokens(batch, tokenizer):
+    if not batch.numel():  # if empty batch
+        return 0
+    return len([t for tokens in batch for t in tokens if t not in tokenizer.all_special_ids])
 
 
 def main():
@@ -268,17 +297,20 @@ def main():
             f"{tokenizer.pad_token}Chewier biscuits are sometimes called cookies"]
     encoded = tokenizer(text, return_tensors="pt", padding=True)
     input_ids = encoded["input_ids"]
-    n_input_toks = get_n_nonspecial_tokens(input_ids, tokenizer.all_special_ids)
-    print("DECODED INPUT", tokenizer.batch_decode(input_ids))
+    n_input_toks = get_n_nonspecial_tokens(input_ids, tokenizer)
 
     processed = process(input_ids, tokenizer)
 
     input_ids_out = processed["input_ids"]
-    n_output_toks = get_n_nonspecial_tokens(input_ids_out, tokenizer.all_special_ids)
-
-    print("DECODED OUTPUT", tokenizer.batch_decode(input_ids_out))
-
+    n_output_toks = get_n_nonspecial_tokens(input_ids_out, tokenizer)
+    # Very coarse calculation. Doing (n_input_toks - n_output_toks) to catch masked spans (one mask for multiple tokens)
+    # but this will then also include added noise for instance
+    # Also, deletion are replaced with padding so there is noise there
     n_masks_out = get_n_mask_tokens(input_ids_out, tokenizer.mask_token_id) + (n_input_toks - n_output_toks)
+
+    print("DECODED INPUT", tokenizer.batch_decode(input_ids))
+    print("NO. NON SPECIAL INPUT", n_input_toks)
+    print("DECODED OUTPUT", tokenizer.batch_decode(input_ids_out))
     print(f"MASK RATIO ({n_masks_out}/{n_input_toks})", n_masks_out / n_input_toks)
 
 
