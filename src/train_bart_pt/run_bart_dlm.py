@@ -244,6 +244,10 @@ class DataCollatorForBartDenoisingLM:
             batch["input_ids"] = self.permute_sentences(batch["input_ids"])
             do_permute = True
 
+        print(batch["input_ids"])
+        print(batch["labels"])
+        exit()
+
         if verbose:
             print("INPUT TENSOR SIZE AFTER PERMUtE", batch["input_ids"].size())
         # masking span of tokens (text infilling in the paper)
@@ -251,15 +255,17 @@ class DataCollatorForBartDenoisingLM:
             batch["input_ids"], batch["labels"] = self.span_mask_tokens(
                 batch["input_ids"], batch["labels"], do_permute
             )
+            print(batch["input_ids"])
+            exit()
         if verbose:
             print("INPUT TENSOR SIZE AFTER MASK", batch["input_ids"].size())
 
         # ignore pad tokens
-        batch["attention_mask"] = (batch["input_ids"] != self.tokenizer.pad_token_id).to(torch.LongTensor)
+        batch["attention_mask"] = (batch["input_ids"] != self.tokenizer.pad_token_id).to(torch.long)
 
         if verbose:
             print("ATTENTION TENSOR SIZE", batch["attention_mask"].size())
-        batch["decoder_attention_mask"] = (batch["decoder_input_ids"] != self.tokenizer.pad_token_id).to(torch.LongTensor)
+        batch["decoder_attention_mask"] = (batch["decoder_input_ids"] != self.tokenizer.pad_token_id).to(torch.long)
         if verbose:
             print("DECODER ATTENTION TENSOR SIZE AFTER MASK", batch["decoder_attention_mask"].size())
 
@@ -335,54 +341,73 @@ class DataCollatorForBartDenoisingLM:
             span_lengths = np.concatenate(
                 [span_lengths, rng.poisson(lam=self.poisson_lambda, size=(num_tokens_to_mask,))]
             )
-        print("span_lengths2", span_lengths)
+
+        span_lengths = torch.tensor(span_lengths)
+        print("span_lengths", span_lengths)
         # remove all spans of length 0
         # note that BART inserts additional mask tokens where length == 0,
         # which we do not implement for now as it adds additional complexity
         span_lengths = span_lengths[span_lengths > 0]
-        print("span_lengths2 no null", span_lengths)
+        print("span_lengths no null", span_lengths)
 
         # trim to about num_tokens_to_mask tokens
-        cutoff_idx = np.argmin(np.abs(np.cumsum(span_lengths, 0) - num_tokens_to_mask)) + 1
+        cutoff_idx = torch.argmin(torch.abs(torch.cumsum(span_lengths, 0) - num_tokens_to_mask)) + 1
         span_lengths = span_lengths[:cutoff_idx]
-        print("span_lengths2 only ~num_tokens_to_mask", span_lengths)
+        print("span_lengths only ~num_tokens_to_mask", span_lengths)
 
         # randomly choose starting positions for masking
-        token_indices = np.argwhere(is_token_mask == 1)
-        span_starts = np.random.permutation(token_indices.shape[0])[: span_lengths.shape[0]]
+        token_indices = torch.argwhere(is_token_mask == 1)
+        print("token_indices", token_indices.size())
+
+        print("span_lengths", span_lengths)
+        span_starts = torch.randperm(token_indices.size(0))[:span_lengths.size(0)]
+        print("span_starts", span_starts)
+        print("span_starts", span_starts.size(0))
+
         # prepare mask
-        masked_indices = np.array(token_indices[span_starts])
-        mask = np.full_like(input_ids, fill_value=False)
+        masked_indices = token_indices[span_starts]
+        print("masked_indices", masked_indices.size())
+        print("masked_indices", masked_indices)
+        mask = torch.full_like(input_ids, fill_value=False, dtype=torch.bool)
+        print("mask", mask.size())
+        print("mask", mask)
 
         # mask starting positions
         for mi in masked_indices:
-            mask[tuple(mi)] = True  # TODO: error here
+            mask[tuple(mi)] = True
+        print("masked_indices", mask.size())
+        print("masked_indices", mask)
         span_lengths -= 1
 
         # fill up spans
-        max_index = input_ids.shape[1] - 1
+        max_index = input_ids.size(1) - 1
+        print("max_index", max_index)
+
         remaining = (span_lengths > 0) & (masked_indices[:, 1] < max_index)
-        while np.any(remaining):
+        print("remaining", remaining)
+        while torch.any(remaining):
             masked_indices[remaining, 1] += 1
+            print("masked_indices", mask.size())
+            print("masked_indices", mask)
             for mi in masked_indices:
                 mask[tuple(mi)] = True
             span_lengths -= 1
             remaining = (span_lengths > 0) & (masked_indices[:, 1] < max_index)
 
         # place the mask tokens
-        mask[np.where(special_tokens_mask_inputs)] = False
-        input_ids[np.where(mask)] = self.tokenizer.mask_token_id
+        mask[torch.where(special_tokens_mask_inputs)] = False
+        input_ids[torch.where(mask)] = self.tokenizer.mask_token_id
         if not do_permute:
-            labels[np.where(mask == 0)] = -100
+            labels[torch.where(mask == 0)] = -100
         else:
-            labels[np.where(special_tokens_mask_labels)] = -100
+            labels[torch.where(special_tokens_mask_labels)] = -100
 
         # remove mask tokens that are not starts of spans
-        to_remove = (mask == 1) & np.roll((mask == 1), 1, 1)
-        new_input_ids = np.full_like(input_ids, fill_value=self.tokenizer.pad_token_id)
+        to_remove = (mask == 1) & torch.roll((mask == 1), 1, 1)
+        new_input_ids = torch.full_like(input_ids, fill_value=self.tokenizer.pad_token_id)
         for i, example in enumerate(input_ids):
             new_example = example[~to_remove[i]]
-            new_input_ids[i, : new_example.shape[0]] = new_example
+            new_input_ids[i, :new_example.size(0)] = new_example
 
         return new_input_ids, labels
 
