@@ -25,22 +25,24 @@ from dataclasses import dataclass, field
 from itertools import chain
 from typing import Optional, Union
 
-import evaluate
 import datasets
-import transformers
 from datasets import load_dataset
 
+import evaluate
+import transformers
+from denoising_collator import DataCollatorForBartDenoisingLM
 from transformers import (
-    BartTokenizer,
     BartConfig,
     BartForConditionalGeneration,
+    BartTokenizer,
     HfArgumentParser,
-    Trainer, TrainingArguments,
-    is_torch_tpu_available, set_seed,
+    Trainer,
+    TrainingArguments,
+    is_torch_tpu_available,
+    set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint
 
-from denoising_collator import DataCollatorForBartDenoisingLM
 
 logger = logging.getLogger(__name__)
 
@@ -148,19 +150,23 @@ class DataTrainingArguments:
     spacy_model: Optional[str] = field(
         default=None,
         metadata={
-            "help": "By default, an English NLTK punct model is used for sentence splitting. If you give a spacy_model"
-                    " name instead, we'll use that for sentence splitting. Note that spaCy and the chosen model have"
-                    " to be installed."
-        }
+            "help": (
+                "By default, an English NLTK punct model is used for sentence splitting. If you give a spacy_model"
+                " name instead, we'll use that for sentence splitting. Note that spaCy and the chosen model have"
+                " to be installed."
+            )
+        },
     )
     no_sentence_splitting: Optional[bool] = field(
         default=False,
         metadata={
-            "help": "By default, an English NLTK punct model is used for sentence splitting, or with 'spacy_model' you"
-                    " can specify a spaCy model for splitting. If you decide to do sentence splitting yourself, you"
-                    " can disable any sentence splitting in this script with this flag. Note that sentences need to be"
-                    " split and then joined together again with the tokenizer's padding token."
-        }
+            "help": (
+                "By default, an English NLTK punct model is used for sentence splitting, or with 'spacy_model' you"
+                " can specify a spaCy model for splitting. If you decide to do sentence splitting yourself, you"
+                " can disable any sentence splitting in this script with this flag. Note that sentences need to be"
+                " split and then joined together again with the tokenizer's padding token."
+            )
+        },
     )
     mask_ratio: float = field(
         default=0.3, metadata={"help": "Ratio of tokens to mask for span masked language modeling loss"}
@@ -169,12 +175,18 @@ class DataTrainingArguments:
         default=0.1, metadata={"help": "The probability with which to (randomly) replace a token by a random token"}
     )
     insert_ratio: float = field(
-        default=0.0, metadata={"help": "The probability with which to (randomly) insert noise. Will add"
-                                       " `insert_ratio * input.numel()` noise"}
+        default=0.0,
+        metadata={
+            "help": (
+                "The probability with which to (randomly) insert noise. Will add `insert_ratio * input.numel()` noise"
+            )
+        },
     )
     rotate_ratio: float = field(
-        default=0.0, metadata={"help": "The probability with which to (randomly) add rolling noise (i.e., shifted"
-                                       " tokens in order)"}
+        default=0.0,
+        metadata={
+            "help": "The probability with which to (randomly) add rolling noise (i.e., shifted tokens in order)"
+        },
     )
     permute_sentence_ratio: float = field(
         default=1.0, metadata={"help": "Ratio of sentences to be permuted in each document"}
@@ -284,15 +296,15 @@ def main():
             cache_dir=model_args.cache_dir,
             use_auth_token=True if model_args.use_auth_token else None,
         )
-        if "validation" not in  loaded_ds.keys():
-             loaded_ds["validation"] = load_dataset(
+        if "validation" not in loaded_ds.keys():
+            loaded_ds["validation"] = load_dataset(
                 data_args.dataset_name,
                 data_args.dataset_config_name,
                 split=f"train[:{data_args.validation_split_percentage}%]",
                 cache_dir=model_args.cache_dir,
                 use_auth_token=True if model_args.use_auth_token else None,
             )
-             loaded_ds["train"] = load_dataset(
+            loaded_ds["train"] = load_dataset(
                 data_args.dataset_name,
                 data_args.dataset_config_name,
                 split=f"train[{data_args.validation_split_percentage}%:]",
@@ -318,7 +330,7 @@ def main():
         )
 
         # If no validation data is there, validation_split_percentage will be used to divide the dataset.
-        if "validation" not in  loaded_ds.keys():
+        if "validation" not in loaded_ds.keys():
             loaded_ds["validation"] = load_dataset(
                 extension,
                 data_files=data_files,
@@ -371,10 +383,7 @@ def main():
 
     # MODEL
     if model_args.model_name_or_path:
-        model = BartForConditionalGeneration.from_pretrained(
-            model_args.model_name_or_path,
-            config=config
-        )
+        model = BartForConditionalGeneration.from_pretrained(model_args.model_name_or_path, config=config)
     else:
         config.vocab_size = len(tokenizer)
         model = BartForConditionalGeneration(config)
@@ -411,18 +420,24 @@ def main():
     # Caching is not working well with spaCy so we use explicit fingerprints
     # Looping over splits because we cannot use new_fingerprint on DatasetDict
     for k in loaded_ds.keys():
-        fingerprint = f"{k}@{data_args.dataset_name}{data_args.dataset_config_name}" if data_args.dataset_name else None
+        fingerprint = (
+            f"{k}@{data_args.dataset_name}{data_args.dataset_config_name}" if data_args.dataset_name else None
+        )
 
         if not data_args.no_sentence_splitting:
             # Do sentence splitting
             sentence_tokenizer = None
             if data_args.spacy_model:
                 import spacy
+
                 spacy.prefer_gpu()
                 # Only load the parser (depparse) which will set sentence boundaries
-                sentence_tokenizer = spacy.load(data_args.spacy_model, exclude=["tagger", "ner", "lemmatizer", "textcat"])
+                sentence_tokenizer = spacy.load(
+                    data_args.spacy_model, exclude=["tagger", "ner", "lemmatizer", "textcat"]
+                )
             else:
                 import nltk
+
                 # Use Punkt Sentence Tokenizer to divide a document into a list of sentences
                 nltk.download("punkt")
                 sentence_tokenizer = nltk.data.load("tokenizers/punkt/english.pickle")
@@ -435,7 +450,10 @@ def main():
                     doc_sents = [[s for s in sentence_tokenizer.tokenize(t)] for t in examples["text"]]
 
                 # use pad token as end of sentence indicator
-                new_texts = [f"{tokenizer.bos_token}{tokenizer.pad_token.join(sents)}{tokenizer.eos_token}" for sents in doc_sents]
+                new_texts = [
+                    f"{tokenizer.bos_token}{tokenizer.pad_token.join(sents)}{tokenizer.eos_token}"
+                    for sents in doc_sents
+                ]
                 return {"text": new_texts}
 
             with training_args.main_process_first(desc="Sentence splitting"):
@@ -448,15 +466,15 @@ def main():
                     remove_columns=column_names,
                     load_from_cache_file=not data_args.overwrite_cache,
                     desc="Sentence splitting",
-                    new_fingerprint=hash_fingerprint(fingerprint)
+                    new_fingerprint=hash_fingerprint(fingerprint),
                 )
                 del sentence_tokenizer
-    
+
         # Tokenize (subword) every text, then concatenate them together before splitting them in smaller parts.
         # Attention masks will be added in the collator
         def tokenize_function(examples):
             return tokenizer(examples[text_column_name], add_special_tokens=False, return_attention_mask=False)
-    
+
         with training_args.main_process_first(desc="Subword tokenization"):
             fingerprint = clean_fingerprint(f"{fingerprint}+tok{model_args.tokenizer_name}") if fingerprint else None
             loaded_ds[k] = loaded_ds[k].map(
@@ -466,9 +484,9 @@ def main():
                 remove_columns=text_column_name,
                 load_from_cache_file=not data_args.overwrite_cache,
                 desc="Tokenizing",
-                new_fingerprint=hash_fingerprint(fingerprint)
+                new_fingerprint=hash_fingerprint(fingerprint),
             )
-    
+
         # Main data processing function that will concatenate all texts from our dataset and generate chunks of
         # max_seq_length.
         def group_texts(examples):
@@ -485,7 +503,7 @@ def main():
                 for k, t in concatenated_examples.items()
             }
             return result
-    
+
         with training_args.main_process_first(desc="Grouping"):
             fingerprint = clean_fingerprint(f"{fingerprint}+group{max_seq_length}") if fingerprint else None
             loaded_ds[k] = loaded_ds[k].map(
@@ -494,7 +512,7 @@ def main():
                 num_proc=data_args.preprocessing_num_workers,
                 load_from_cache_file=not data_args.overwrite_cache,
                 desc=f"Grouping in blocks of {max_seq_length}",
-                new_fingerprint=hash_fingerprint(fingerprint)
+                new_fingerprint=hash_fingerprint(fingerprint),
             )
 
     train_dataset = None
