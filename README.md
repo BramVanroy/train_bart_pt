@@ -61,6 +61,7 @@ Adapated the defaults to the
 [given BART args](https://github.com/facebookresearch/fairseq/issues/1899#issuecomment-1069429320). This differs in
 the Flax defaults in one respect, namely `poisson_lambda`, which is now set to `3.5` instead of `3.0`.
 
+
 ### HF (Flax), fairseq, and current implementation
 
 There are some differences in implementation.
@@ -82,6 +83,20 @@ padding token, though, so no need to add that separately.
 - The Flax example does not include methods to add more noise. I have ported those as well.
 - However, I did not adapt `add_insertion_noise` to work well with padded sequences. So the inserted noise may occur
 ANYWHERE I am not sure whether this is intended behavior (I think the sentence separating PADs can now also be replaced?)
+
+Alternatively, we could implement all this processing on the dataset level and use `Dataset.map`. This has some
+advantages:
+
+- more true to fairseq implementation (sample level rather than batch level);
+- cached.
+
+... and disadvantages:
+
+- potentially slower (not batched), although we can integrate a batched approach. But as discussed above, this will be
+less true to the original fairseq implementation in `add_insertion_noise`
+- every sample is always processed the same. So in small datasets which are seen multiple times by the model, the 
+same sample will always be processed the same. In a dataloader, that will not be the case because the processing
+occurs on every iteration rather than once before training.
 
 ### Questions/Uncertainties
 - Do the padding tokens still serve a purpose after permutation? (Teaching the model to learn to detect sentence boundaries?)

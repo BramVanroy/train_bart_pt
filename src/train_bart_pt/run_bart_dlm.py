@@ -497,7 +497,7 @@ def main():
             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
             eval_dataset = eval_dataset.select(range(max_eval_samples))
 
-    # Data collator ill take care of randomly masking the tokens and permuting the sentences.
+    # Data collator will take care of randomly masking the tokens/spans, permuting sentences, adding noise
     data_collator = DataCollatorForBartDenoisingLM(
         tokenizer=tokenizer,
         decoder_start_token_id=model.config.decoder_start_token_id,
