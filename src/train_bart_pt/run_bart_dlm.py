@@ -148,7 +148,16 @@ class DataTrainingArguments:
         metadata={
             "help": "By default, an English NLTK punct model is used for sentence splitting. If you give a spacy_model"
                     " name instead, we'll use that for sentence splitting. Note that spaCy and the chosen model have"
-                    " to be installe.d"
+                    " to be installed."
+        }
+    )
+    no_sentence_splitting: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "By default, an English NLTK punct model is used for sentence splitting, or with 'spacy_model' you"
+                    " can specify a spaCy model for splitting. If you decide to do sentence splitting yourself, you"
+                    " can disable any sentence splitting in this script with this flag. Note that sentences need to be"
+                    " split and then joined together again with the tokenizer's padding token."
         }
     )
     mask_ratio: float = field(
@@ -387,49 +396,51 @@ def main():
     # Looping over splits because we cannot use new_fingerprint on DatasetDict
     for k in loaded_ds.keys():
         base_fingerprint = f"{k}@{data_args.dataset_name}{data_args.dataset_config_name}" if data_args.dataset_name else None
-        # Do sentence splitting
-        sentence_tokenizer = None
-        if data_args.spacy_model:
-            import spacy
-            spacy.prefer_gpu()
-            # Only load the parser (depparse) which will set sentence boundaries
-            sentence_tokenizer = spacy.load(data_args.spacy_model, exclude=["tagger", "ner", "lemmatizer", "textcat"])
-        else:
-            import nltk
-            # Use Punkt Sentence Tokenizer to divide a document into a list of sentences
-            nltk.download("punkt")
-            sentence_tokenizer = nltk.data.load("tokenizers/punkt/english.pickle")
-    
-        def sentence_split(examples):
+
+        if not data_args.no_sentence_splitting:
+            # Do sentence splitting
+            sentence_tokenizer = None
             if data_args.spacy_model:
-                docs = sentence_tokenizer.pipe(examples["text"])
-                doc_sents = [map(str, doc.sents) for doc in docs]
+                import spacy
+                spacy.prefer_gpu()
+                # Only load the parser (depparse) which will set sentence boundaries
+                sentence_tokenizer = spacy.load(data_args.spacy_model, exclude=["tagger", "ner", "lemmatizer", "textcat"])
             else:
-                doc_sents = [[s for s in sentence_tokenizer.tokenize(t)] for t in examples["text"]]
-    
-            # use pad token as end of sentence indicator
-            new_texts = [f"{tokenizer.bos_token}{tokenizer.pad_token.join(sents)}{tokenizer.eos_token}" for sents in doc_sents]
-            return {"text": new_texts}
-    
-        with training_args.main_process_first(desc=f"Sentence splitting texts (k)"):
-            # If using spaCy, we don't run multiple workers here but pass that to spacy's pipe
-            loaded_ds[k] = loaded_ds[k].map(
-                sentence_split,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                remove_columns=column_names,
-                load_from_cache_file=not data_args.overwrite_cache,
-                desc="Sentence splitting",
-                new_fingerprint=f"{base_fingerprint}+ss{data_args.spacy_model}"
-            )
-            del sentence_tokenizer
+                import nltk
+                # Use Punkt Sentence Tokenizer to divide a document into a list of sentences
+                nltk.download("punkt")
+                sentence_tokenizer = nltk.data.load("tokenizers/punkt/english.pickle")
+
+            def sentence_split(examples):
+                if data_args.spacy_model:
+                    docs = sentence_tokenizer.pipe(examples["text"])
+                    doc_sents = [map(str, doc.sents) for doc in docs]
+                else:
+                    doc_sents = [[s for s in sentence_tokenizer.tokenize(t)] for t in examples["text"]]
+
+                # use pad token as end of sentence indicator
+                new_texts = [f"{tokenizer.bos_token}{tokenizer.pad_token.join(sents)}{tokenizer.eos_token}" for sents in doc_sents]
+                return {"text": new_texts}
+
+            with training_args.main_process_first(desc="Sentence splitting"):
+                # If using spaCy, we don't run multiple workers here but pass that to spacy's pipe
+                loaded_ds[k] = loaded_ds[k].map(
+                    sentence_split,
+                    batched=True,
+                    num_proc=data_args.preprocessing_num_workers,
+                    remove_columns=column_names,
+                    load_from_cache_file=not data_args.overwrite_cache,
+                    desc="Sentence splitting",
+                    new_fingerprint=f"{base_fingerprint}+ss{data_args.spacy_model}"
+                )
+                del sentence_tokenizer
     
         # Tokenize (subword) every text, then concatenate them together before splitting them in smaller parts.
         # Attention masks will be added in the collator
         def tokenize_function(examples):
             return tokenizer(examples[text_column_name], add_special_tokens=False, return_attention_mask=False)
     
-        with training_args.main_process_first(desc="dataset map tokenization"):
+        with training_args.main_process_first(desc="Subword tokenization"):
             loaded_ds[k] = loaded_ds[k].map(
                 tokenize_function,
                 batched=True,
@@ -437,7 +448,7 @@ def main():
                 remove_columns=text_column_name,
                 load_from_cache_file=not data_args.overwrite_cache,
                 desc="Tokenizing",
-                new_fingerprint=f"{base_fingerprint}+ss{data_args.spacy_model}+tok"
+                new_fingerprint=f"{base_fingerprint}+ss{data_args.spacy_model}+tok{model_args.tokenizer_name}"
             )
     
         # Main data processing function that will concatenate all texts from our dataset and generate chunks of
@@ -457,14 +468,15 @@ def main():
             }
             return result
     
-        with training_args.main_process_first(desc="Grouping texts together"):
+        with training_args.main_process_first(desc="Grouping"):
             loaded_ds[k] = loaded_ds[k].map(
                 group_texts,
                 batched=True,
                 num_proc=data_args.preprocessing_num_workers,
                 load_from_cache_file=not data_args.overwrite_cache,
-                desc=f"Grouping texts in sequences of {max_seq_length}",
-                new_fingerprint=f"{base_fingerprint}+ss{data_args.spacy_model}+tok+group{max_seq_length}"
+                desc=f"Grouping in blocks of {max_seq_length}",
+                new_fingerprint=f"{base_fingerprint}+ss{data_args.spacy_model}+tok{model_args.tokenizer_name}"
+                                f"+group{max_seq_length}"
             )
 
     train_dataset = None
