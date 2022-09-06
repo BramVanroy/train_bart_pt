@@ -15,13 +15,15 @@
 # limitations under the License.
 """Pretraining models for denoising language modeling on a text file or a dataset.
 """
+import hashlib
 import logging
 import math
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Optional
+from typing import Optional, Union
 
 import evaluate
 import datasets
@@ -195,6 +197,19 @@ class DataTrainingArguments:
                     raise ValueError("`validation_file` should be a csv, a json or a txt file.")
 
 
+def clean_fingerprint(fingerprint: str):
+    return re.sub(r"[<>:/\\|?*.]", "", fingerprint)
+
+
+def hash_fingerprint(text: Optional[str], length: int = 49) -> Union[None, str]:
+    if text is None:
+        return None
+    # Using a length of 49: max. length in datasets for fingerprint is 64
+    # and by using multiple workers, an additional fingerprint like `_00000_of_00004`
+    # is added to the end. So we just have room for 49
+    return str(int(hashlib.sha256(text.encode("utf-8")).hexdigest(), 16) % 10**length)
+
+
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
@@ -333,6 +348,7 @@ def main():
         tokenizer = BartTokenizer.from_pretrained(model_args.tokenizer_name, **tokenizer_kwargs)
     elif model_args.model_name_or_path:
         tokenizer = BartTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
+        model_args.tokenizer_name = model_args.model_name_or_path
     else:
         raise ValueError(
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
@@ -395,7 +411,7 @@ def main():
     # Caching is not working well with spaCy so we use explicit fingerprints
     # Looping over splits because we cannot use new_fingerprint on DatasetDict
     for k in loaded_ds.keys():
-        base_fingerprint = f"{k}@{data_args.dataset_name}{data_args.dataset_config_name}" if data_args.dataset_name else None
+        fingerprint = f"{k}@{data_args.dataset_name}{data_args.dataset_config_name}" if data_args.dataset_name else None
 
         if not data_args.no_sentence_splitting:
             # Do sentence splitting
@@ -424,6 +440,7 @@ def main():
 
             with training_args.main_process_first(desc="Sentence splitting"):
                 # If using spaCy, we don't run multiple workers here but pass that to spacy's pipe
+                fingerprint = clean_fingerprint(f"{fingerprint}+ss{data_args.spacy_model}") if fingerprint else None
                 loaded_ds[k] = loaded_ds[k].map(
                     sentence_split,
                     batched=True,
@@ -431,7 +448,7 @@ def main():
                     remove_columns=column_names,
                     load_from_cache_file=not data_args.overwrite_cache,
                     desc="Sentence splitting",
-                    new_fingerprint=f"{base_fingerprint}+ss{data_args.spacy_model}"
+                    new_fingerprint=hash_fingerprint(fingerprint)
                 )
                 del sentence_tokenizer
     
@@ -441,6 +458,7 @@ def main():
             return tokenizer(examples[text_column_name], add_special_tokens=False, return_attention_mask=False)
     
         with training_args.main_process_first(desc="Subword tokenization"):
+            fingerprint = clean_fingerprint(f"{fingerprint}+tok{model_args.tokenizer_name}") if fingerprint else None
             loaded_ds[k] = loaded_ds[k].map(
                 tokenize_function,
                 batched=True,
@@ -448,7 +466,7 @@ def main():
                 remove_columns=text_column_name,
                 load_from_cache_file=not data_args.overwrite_cache,
                 desc="Tokenizing",
-                new_fingerprint=f"{base_fingerprint}+ss{data_args.spacy_model}+tok{model_args.tokenizer_name}"
+                new_fingerprint=hash_fingerprint(fingerprint)
             )
     
         # Main data processing function that will concatenate all texts from our dataset and generate chunks of
@@ -469,14 +487,14 @@ def main():
             return result
     
         with training_args.main_process_first(desc="Grouping"):
+            fingerprint = clean_fingerprint(f"{fingerprint}+group{max_seq_length}") if fingerprint else None
             loaded_ds[k] = loaded_ds[k].map(
                 group_texts,
                 batched=True,
                 num_proc=data_args.preprocessing_num_workers,
                 load_from_cache_file=not data_args.overwrite_cache,
                 desc=f"Grouping in blocks of {max_seq_length}",
-                new_fingerprint=f"{base_fingerprint}+ss{data_args.spacy_model}+tok{model_args.tokenizer_name}"
-                                f"+group{max_seq_length}"
+                new_fingerprint=hash_fingerprint(fingerprint)
             )
 
     train_dataset = None
