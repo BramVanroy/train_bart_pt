@@ -28,7 +28,6 @@ python prepare_tokenizer.py \
 
 ```shell
 python prepare_config.py \
-    oscar \
     --pretrained_model_name facebook/bart-base \
     --dout ./my-bart-model
 ```
