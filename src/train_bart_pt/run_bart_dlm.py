@@ -426,22 +426,6 @@ def main():
 
         if not data_args.no_sentence_splitting:
             # Do sentence splitting
-            sentence_tokenizer = None
-            if data_args.spacy_model:
-                import spacy
-
-                spacy.prefer_gpu()
-                # Only load the parser (depparse) which will set sentence boundaries
-                sentence_tokenizer = spacy.load(
-                    data_args.spacy_model, exclude=["tagger", "ner", "lemmatizer", "textcat"]
-                )
-            else:
-                import nltk
-
-                # Use Punkt Sentence Tokenizer to divide a document into a list of sentences
-                nltk.download("punkt")
-                sentence_tokenizer = nltk.data.load("tokenizers/punkt/english.pickle")
-
             def sentence_split(examples):
                 if data_args.spacy_model:
                     docs = sentence_tokenizer.pipe(examples["text"])
@@ -457,6 +441,21 @@ def main():
                 return {"text": new_texts}
 
             with training_args.main_process_first(desc="Sentence splitting"):
+                sentence_tokenizer = None
+                if data_args.spacy_model:
+                    import spacy
+
+                    spacy.prefer_gpu()
+                    # Only load the parser (depparse) which will set sentence boundaries
+                    sentence_tokenizer = spacy.load(
+                        data_args.spacy_model, exclude=["tagger", "ner", "lemmatizer", "textcat"]
+                    )
+                else:
+                    import nltk
+
+                    # Use Punkt Sentence Tokenizer to divide a document into a list of sentences
+                    nltk.download("punkt")
+                    sentence_tokenizer = nltk.data.load("tokenizers/punkt/english.pickle")
                 # If using spaCy, we don't run multiple workers here but pass that to spacy's pipe
                 fingerprint = clean_fingerprint(f"{fingerprint}+ss{data_args.spacy_model}") if fingerprint else None
                 loaded_ds[k] = loaded_ds[k].map(
