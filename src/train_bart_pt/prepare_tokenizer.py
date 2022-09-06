@@ -34,7 +34,7 @@ def train_tokenizer(
     # Save to disk
     pdout = Path(dout).resolve()
     pdout.mkdir(exist_ok=True, parents=True)
-    tokenizer.save_model(str(pdout))
+    tokenizer.save_pretrained(str(pdout))
 
 
 def main():
