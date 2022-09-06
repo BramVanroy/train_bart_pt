@@ -28,7 +28,6 @@ python prepare_tokenizer.py \
 
 ```shell
 python prepare_config.py \
-    oscar \
     --pretrained_model_name facebook/bart-base \
     --dout ./my-bart-model
 ```
@@ -54,17 +53,19 @@ python run_bart_dlm.py \
 As part of BART, the sentences in a sample may be permuted (reordered). To detect sentences for each sample, we need
 sentence splitting. By dfault, we'll use NLTK's English punct sentence splitter but by passing a spaCy model name
 to `spacy_model` (e.g. `en_core_web_sm`) you can also rely on spaCy for better (but slower) sentence splitting.
+You can also disable sentence splitting completely with `--no_sentence_splitting`. In that case, make sure the
+sentences are already split with a padding token between them (`<pad>`).
 
 
 ### Default values
-Adapated the defaults to the
-[given BART args](https://github.com/facebookresearch/fairseq/issues/1899#issuecomment-1069429320). This differs in
+The defaults are set to the
+[given BART args](https://github.com/facebookresearch/fairseq/issues/1899#issuecomment-1069429320). This differs from
 the Flax defaults in one respect, namely `poisson_lambda`, which is now set to `3.5` instead of `3.0`.
 
 
 ### HF (Flax), fairseq, and current implementation
 
-There are some differences in implementation.
+There are some differences in implementation between fairseq, the HF FLAX example, and this PyTorch implementation.
 
 - `argwhere` in the Flax example
 [in this position](https://github.com/huggingface/transformers/blob/65fb71bc762c46bb067306c1fd083b1cba87a095/examples/flax/language-modeling/run_bart_dlm_flax.py#L319)
@@ -76,13 +77,13 @@ same sequence length and there should not be any padding.)
 - I found that the result of sentence permutation was not consistent in terms of where the separating pad token ended
 up ([bug report](https://github.com/facebookresearch/fairseq/issues/4695)), so I have reimplemented that method so
 that sentences in a sequence are still separated by a padding token, even after permutation.
-- In HF, the token_mask is restricted to [non-special and non-padding tokens](https://github.com/huggingface/transformers/blob/65fb71bc762c46bb067306c1fd083b1cba87a095/examples/flax/language-modeling/run_bart_dlm_flax.py#L361).
+- In HF FLAX, the token_mask is restricted to [non-special and non-padding tokens](https://github.com/huggingface/transformers/blob/65fb71bc762c46bb067306c1fd083b1cba87a095/examples/flax/language-modeling/run_bart_dlm_flax.py#L361).
 In Fairseq, by default, only the first and last tokens are excluded and [all others](https://github.com/facebookresearch/fairseq/blob/1bba712622b8ae4efb3eb793a8a40da386fe11d0/fairseq/data/denoising_dataset.py#L241)
 are prone to masking. The HF implementation seems sensible so I follow that. `get_special_tokens_mask` includes the 
 padding token, though, so no need to add that separately.
 - The Flax example does not include methods to add more noise. I have ported those as well.
 - However, I did not adapt `add_insertion_noise` to work well with padded sequences. So the inserted noise may occur
-ANYWHERE I am not sure whether this is intended behavior (I think the sentence separating PADs can now also be replaced?)
+ANYWHERE. It is unclear whether this is intended behavior.
 
 Alternatively, we could implement all this processing on the dataset level and use `Dataset.map`. This has some
 advantages:
