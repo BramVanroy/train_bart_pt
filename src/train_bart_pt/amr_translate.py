@@ -17,8 +17,8 @@ def batch_sentences(batch, batch_size: int = 32):
 
 def translate(amr_dir: Union[str, PathLike], output_dir: Union[str, PathLike],
               model_name_or_path: Union[str, PathLike] = "facebook/m2m100_418M",
-              src_lang="en", tgt_lang="nl", batch_size=32, max_length=256, no_cuda: bool = False,
-              verbose: bool = False):
+              src_lang="en", tgt_lang="nl", batch_size=32, max_length=256, num_threads: int = None,
+              no_cuda: bool = False, verbose: bool = False):
     """Given a directory of AMR, all .txt files will recursively be traversed and translated. All the lines
     that start with "# ::snt " will be translated
 
@@ -29,11 +29,15 @@ def translate(amr_dir: Union[str, PathLike], output_dir: Union[str, PathLike],
     :param tgt_lang: language code of target language
     :param batch_size: batch size of translating simultaneously. Set to lower value if you get out of memory issues
     :param max_length: max length to generate translations
+    :param num_threads: if not using CUDA, how many threads to use in torch for parallel operations. By default, as
+    many threads as available will be used
     :param no_cuda: whether to disable CUDA if it is available
     :param verbose: whether to print translations to stdout
     """
     if not torch.cuda.is_available():
         no_cuda = True
+        if num_threads:
+            torch.set_num_threads(num_threads)
 
     model = M2M100ForConditionalGeneration.from_pretrained(model_name_or_path)
 
@@ -110,11 +114,15 @@ def main():
                          help="batch size of translating simultaneously. Set to lower value if you get"
                               " out of memory issues")
     cparser.add_argument("--max_length", type=int, default=256, help="max length to generate translations")
+    cparser.add_argument("--num_threads", type=int, default=None,
+                         help="if not using CUDA, how many threads to use in torch for parallel operations."
+                              " By default, as many threads as available will be used")
     cparser.add_argument("--no_cuda", action="store_true", help="whether to disable CUDA if it is available")
     cparser.add_argument("-v", "--verbose", action="store_true", help="whether to print translations to stdout")
 
     cargs = cparser.parse_args()
     translate(**vars(cargs))
+
 
 
 if __name__ == "__main__":
