@@ -36,8 +36,9 @@ def translate(amr_dir: Union[str, PathLike], output_dir: Union[str, PathLike],
     """
     if not torch.cuda.is_available():
         no_cuda = True
-        if num_threads:
-            torch.set_num_threads(num_threads)
+
+    if no_cuda and num_threads:
+        torch.set_num_threads(num_threads)
 
     model = M2M100ForConditionalGeneration.from_pretrained(model_name_or_path)
 
