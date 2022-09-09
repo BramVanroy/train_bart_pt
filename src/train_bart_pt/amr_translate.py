@@ -9,10 +9,10 @@ from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
 import torch
 
 
-def batch_sentences(batch, batch_size: int = 32):
-    batch_len = len(batch)
+def batch_sentences(sentences, batch_size: int = 32):
+    batch_len = len(sentences)
     for idx in range(0, batch_len, batch_size):
-        yield batch[idx:min(idx + batch_size, batch_len)]
+        yield sentences[idx:min(idx + batch_size, batch_len)]
 
 
 def translate(amr_dir: Union[str, PathLike], output_dir: Union[str, PathLike],
@@ -59,7 +59,7 @@ def translate(amr_dir: Union[str, PathLike], output_dir: Union[str, PathLike],
             sentences = [(line_idx, line[8:]) for line_idx, line in enumerate(lines) if line.startswith("# ::snt ")]
 
             for batch in tqdm(list(batch_sentences(sentences, batch_size=batch_size)), unit="batch", leave=False):
-                b_idxs, b_sentences = batch
+                b_idxs, b_sentences = zip(*batch)
                 encoded = tokenizer(b_sentences, return_tensors="pt", padding=True)
                 if not no_cuda:
                     encoded = encoded.to("cuda")
